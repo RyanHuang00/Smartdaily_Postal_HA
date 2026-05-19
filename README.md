@@ -1,6 +1,18 @@
-# Smartdaily\_Postal\_HA
+# Smartdaily\_Postal\_HA · RyanHuang00 fork
 
+> **這是 [`andyching168/Smartdaily_Postal_HA`](https://github.com/andyching168/Smartdaily_Postal_HA) 的個人 fork**，原作所有功能 + 文件保留不動。本 fork 多出下列能力：
+>
+> - **`sensor.bao_guo_li_shi`**：暴露 `coordinator.data["all_packages"]` 為 attribute（最近 30 筆含已領 + 未領 + 本機照片路徑）。
+> - **照片自動歸檔**：每次 poll 把新 `postal_img` 下載到 `/config/www/packages/<pd_id>.jpg`，永久保存（規避上游 GCS signed URL 15 分鐘過期）。
+> - **新事件 `smartdaily_postal_ha_new_package`**：每當 poll 偵測到新 `pd_id` 即 fire，event payload 為完整 package dict。
+> - **新事件 `smartdaily_postal_ha_package_picked_up`**：每當 `p_status` 從 `1` 轉 `2` 即 fire，event payload 含 `previous_status`、`new_status`。
+> - HA 重啟後第一次 poll 不 fire 任何事件，避免歷史包裹被誤判為「新到」。
+>
+> 詳見 commit `feat: history sensor + photo archive + new_package / package_picked_up events`。
+>
+> 上游沒有 LICENSE 檔，本 fork 也不另行授權；僅做個人使用。
 
+---
 
 ### 將今網智生活的包裹領取狀態串接到Home Assistant的工具
 

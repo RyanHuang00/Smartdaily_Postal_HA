@@ -1,12 +1,13 @@
 {
     "domain": "smartdaily_postal_ha",
     "name": "智生活包裹追蹤",
-    "version": "0.5.5",
+    "version": "0.7.0",
     "iot_class": "cloud_polling",
-    "documentation": "https://github.com/andyching168/Smartdaily_Postal_HA",
-    "issue_tracker": "https://github.com/andyching168/Smartdaily_Postal_HA/issues",
+    "documentation": "https://github.com/RyanHuang00/Smartdaily_Postal_HA",
+    "issue_tracker": "https://github.com/RyanHuang00/Smartdaily_Postal_HA/issues",
     "config_flow": true,
     "codeowners": [
-        "@andyching168"
+        "@andyching168",
+        "@RyanHuang00"
     ]
 }
