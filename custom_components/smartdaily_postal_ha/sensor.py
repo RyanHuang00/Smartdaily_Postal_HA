@@ -132,6 +132,8 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
             prev_ids = set(self._previous_pd_status.keys())
             curr_ids = set(curr_status.keys())
 
+            unclaimed_count = result.get("unclaimed_count", 0)
+
             # New packages: pd_id appears for the first time.
             for pid in curr_ids - prev_ids:
                 pkg = next(
@@ -140,7 +142,9 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
                 )
                 if pkg:
                     _LOGGER.info("New package detected: %s", pid)
-                    self.hass.bus.async_fire(EVENT_NEW_PACKAGE, dict(pkg))
+                    event_data = dict(pkg)
+                    event_data["unclaimed_count"] = unclaimed_count
+                    self.hass.bus.async_fire(EVENT_NEW_PACKAGE, event_data)
 
             # Pickup transitions: same pd_id, p_status changed to 已取件 (2).
             for pid in curr_ids & prev_ids:
@@ -158,6 +162,7 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
                         event_data = dict(pkg)
                         event_data["previous_status"] = old_status
                         event_data["new_status"] = new_status
+                        event_data["unclaimed_count"] = unclaimed_count
                         self.hass.bus.async_fire(EVENT_PACKAGE_PICKED_UP, event_data)
 
         self._previous_pd_status = curr_status
