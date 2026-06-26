@@ -1,7 +1,9 @@
+import asyncio
 import pytest
 from custom_components.smartdaily_postal_ha.sensor import (
     PackageTrackerSensor,
     PackageSlotSensor,
+    SmartdailyDataUpdateCoordinator,
     parse_time,
 )
 
@@ -134,3 +136,58 @@ def test_slot_sensor_attributes_with_package():
     assert attrs["pd_id"] == "123"
     assert attrs["p_name"] == "測試包裹"
     assert attrs["postal_img"] == "https://example.com/img.jpg"
+
+
+def test_new_package_event_waits_for_photo_archive(monkeypatch):
+    order = []
+    events = []
+
+    class FakeBus:
+        def async_fire(self, event_type, event_data):
+            order.append("fire")
+            events.append((event_type, event_data))
+
+    class FakeHass:
+        bus = FakeBus()
+
+        async def async_add_executor_job(self, func, *args):
+            return func(*args)
+
+        def async_create_task(self, coro):
+            coro.close()
+
+    new_pid = "abc123abc123abc"
+    coordinator = SmartdailyDataUpdateCoordinator(FakeHass(), "device", "community")
+    coordinator._previous_pd_status = {"old123old123old": 1}
+
+    result = {
+        "all_packages": [
+            {
+                "package": {
+                    "pd_id": new_pid,
+                    "p_status": 1,
+                    "postal_img": "https://example.com/package.jpg",
+                },
+                "parsed_time": "2026/06/26 10:00",
+            }
+        ],
+        "unclaimed_count": 1,
+    }
+
+    monkeypatch.setattr(coordinator, "_fetch_data", lambda: result)
+
+    async def fake_archive_photos(hass, packages):
+        order.append("archive")
+        assert packages == result["all_packages"]
+        return {new_pid}
+
+    monkeypatch.setattr(
+        "custom_components.smartdaily_postal_ha.sensor.archive_photos",
+        fake_archive_photos,
+    )
+
+    asyncio.get_event_loop().run_until_complete(coordinator._async_update_data())
+
+    assert order == ["archive", "fire"]
+    assert events[0][1]["pd_id"] == new_pid
+    assert events[0][1]["photo_local_ready"] is True

@@ -8,7 +8,7 @@ via /local/packages/<pd_id>.jpg.
 
 import logging
 import os
-from typing import List
+from typing import List, Set
 
 import aiohttp
 import aiofiles
@@ -19,18 +19,20 @@ PHOTO_DIR = "/config/www/packages"
 DOWNLOAD_TIMEOUT = 15  # seconds per photo
 
 
-async def archive_photos(hass, all_packages: List[dict]) -> None:
+async def archive_photos(hass, all_packages: List[dict]) -> Set[str]:
     """Download any package photos that aren't already on disk.
 
     Best-effort: individual failures do not raise. Safe to call repeatedly;
-    files already present are skipped without re-downloading.
+    files already present are skipped without re-downloading. Returns the set of
+    pd_ids that have a local file after the archival attempt.
     """
     try:
         await hass.async_add_executor_job(_ensure_dir)
     except Exception as exc:
         _LOGGER.warning("Could not create photo dir %s: %s", PHOTO_DIR, exc)
-        return
+        return set()
 
+    archived: Set[str] = set()
     timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for entry in all_packages:
@@ -41,27 +43,32 @@ async def archive_photos(hass, all_packages: List[dict]) -> None:
                 continue
             path = os.path.join(PHOTO_DIR, f"{pd_id}.jpg")
             if await hass.async_add_executor_job(os.path.exists, path):
+                archived.add(pd_id)
                 continue
-            await _download_one(session, url, path, pd_id)
+            if await _download_one(session, url, path, pd_id):
+                archived.add(pd_id)
+    return archived
 
 
-async def _download_one(session: aiohttp.ClientSession, url: str, path: str, pd_id: str) -> None:
+async def _download_one(session: aiohttp.ClientSession, url: str, path: str, pd_id: str) -> bool:
     try:
         async with session.get(url) as resp:
             if resp.status != 200:
                 _LOGGER.debug("Photo %s HTTP %s", pd_id, resp.status)
-                return
+                return False
             data = await resp.read()
     except Exception as exc:
         _LOGGER.debug("Photo %s fetch failed: %s", pd_id, exc)
-        return
+        return False
 
     try:
         async with aiofiles.open(path, "wb") as f:
             await f.write(data)
         _LOGGER.info("Archived package photo %s (%d bytes)", pd_id, len(data))
+        return True
     except Exception as exc:
         _LOGGER.warning("Photo %s write failed: %s", pd_id, exc)
+        return False
 
 
 def _ensure_dir() -> None:

@@ -131,11 +131,24 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
         if self._previous_pd_status is not None:
             prev_ids = set(self._previous_pd_status.keys())
             curr_ids = set(curr_status.keys())
+            new_ids = curr_ids - prev_ids
 
             unclaimed_count = result.get("unclaimed_count", 0)
+            archived_new_ids = set()
+
+            if new_ids:
+                new_package_entries = [
+                    entry
+                    for entry in all_packages
+                    if (entry.get("package") or {}).get("pd_id") in new_ids
+                ]
+                # LINE fetches Flex hero images immediately after receiving the
+                # message. Archive new package photos before firing the event so
+                # the photo proxy does not return a transient 404.
+                archived_new_ids = await archive_photos(self.hass, new_package_entries)
 
             # New packages: pd_id appears for the first time.
-            for pid in curr_ids - prev_ids:
+            for pid in new_ids:
                 pkg = next(
                     (p["package"] for p in all_packages if p["package"].get("pd_id") == pid),
                     None,
@@ -144,6 +157,7 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.info("New package detected: %s", pid)
                     event_data = dict(pkg)
                     event_data["unclaimed_count"] = unclaimed_count
+                    event_data["photo_local_ready"] = pid in archived_new_ids
                     self.hass.bus.async_fire(EVENT_NEW_PACKAGE, event_data)
 
             # Pickup transitions: same pd_id, p_status changed to 已取件 (2).
