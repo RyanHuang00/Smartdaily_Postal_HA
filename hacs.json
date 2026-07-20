@@ -3,6 +3,6 @@
     "homeassistant": "2024.1.0",
     "render_readme": true,
     "domain": "smartdaily_postal_ha",
-    "documentation": "https://github.com/andyching168/Smartdaily_Postal_HA",
-    "issue_tracker": "https://github.com/andyching168/Smartdaily_Postal_HA/issues"
+    "documentation": "https://github.com/RyanHuang00/Smartdaily_Postal_HA",
+    "issue_tracker": "https://github.com/RyanHuang00/Smartdaily_Postal_HA/issues"
   }
