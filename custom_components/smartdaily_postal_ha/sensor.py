@@ -26,7 +26,71 @@ MAX_PACKAGE_SLOTS = 4  # 最多顯示 4 個包裹 slot
 HISTORY_LIMIT = 30  # PackageHistorySensor attribute cap (~16KB attribute soft limit)
 EVENT_NEW_PACKAGE = f"{DOMAIN}_new_package"
 EVENT_PACKAGE_PICKED_UP = f"{DOMAIN}_package_picked_up"
+EVENT_NEW_COLLECTION = f"{DOMAIN}_new_collection"
 STATUS_PICKED_UP = 2  # observed mapping: 1 = 未領取, 2 = 已取件
+COLLECTION_URL = "https://api.smartdaily.com.tw/api/Collection/getCollectionPayment"
+
+
+def _collection_scalar(value):
+    """Return a stable string for a scalar collection field."""
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return ""
+    return str(value).strip()
+
+
+def _collection_id(item, _configured_com_id=None):
+    """Build an ID that is stable across config entries for the same account."""
+    serial_num = _collection_scalar(item.get("serial_num"))
+    if not serial_num:
+        return None
+
+    # getCollectionPayment is account-scoped and does not accept com_id. The
+    # same response can therefore be seen by multiple community config entries.
+    # Prefer the response's own community label and use an account-wide fallback
+    # so one record has the same identity in every coordinator.
+    scope = _collection_scalar(item.get("community")) or "account"
+    # serial_num appears to be the API's primary identifier. Including the
+    # storage date prevents a reused serial number in another delivery from
+    # being mistaken for an item already seen during this HA session.
+    sdate = _collection_scalar(item.get("sdate"))
+    return f"{scope}:{serial_num}:{sdate}"
+
+
+def _is_uncollected(item):
+    """Interpret is_end defensively without altering the original API field."""
+    return _collection_scalar(item.get("is_end")).lower() == "no"
+
+
+def normalize_collection_response(payload, com_id):
+    """Validate and normalize a getCollectionPayment response.
+
+    Return ``(True, items)`` for a structurally valid response, including an
+    empty Data list. Return ``(False, [])`` for malformed payloads so callers
+    can distinguish an actual empty result from a failed poll and preserve the
+    notification baseline.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("Data"), list):
+        return False, []
+
+    normalized_by_id = {}
+    for raw_item in payload["Data"]:
+        if not isinstance(raw_item, dict):
+            continue
+
+        collection_id = _collection_id(raw_item, com_id)
+        if collection_id is None:
+            # Without serial_num there is no safe way to deduplicate events.
+            _LOGGER.warning("Ignoring collection item without serial_num")
+            continue
+
+        # Keep every original API field/value intact in the future event
+        # payload; normalization is used only for identity and comparisons.
+        item = dict(raw_item)
+        item["collection_id"] = collection_id
+        # Deduplicate malformed API responses while retaining API order.
+        normalized_by_id[collection_id] = item
+
+    return True, list(normalized_by_id.values())
 
 
 def parse_time(time_str):
@@ -76,7 +140,7 @@ def parse_time(time_str):
 class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching Smartdaily data."""
 
-    def __init__(self, hass, device_id, com_id):
+    def __init__(self, hass, device_id, com_id, collection_state=None):
         """Initialize the coordinator."""
         super().__init__(
             hass,
@@ -91,6 +155,23 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
         # integration doesn't spam events for the entire backlog on startup; also
         # used to detect status transitions (未領取 1 -> 已取件 2).
         self._previous_pd_status = None
+        # Config entries for the same DeviceID share this session-scoped state.
+        # The Collection endpoint is account-scoped, so sharing prevents the
+        # same row from firing once per selected community. IDs only ever grow;
+        # None means no successful baseline yet.
+        self._collection_state = (
+            collection_state if collection_state is not None else {}
+        )
+        self._collection_state.setdefault("known_ids", None)
+
+    @property
+    def _known_collection_ids(self):
+        """Return shared collection IDs while preserving the existing interface."""
+        return self._collection_state["known_ids"]
+
+    @_known_collection_ids.setter
+    def _known_collection_ids(self, value):
+        self._collection_state["known_ids"] = value
 
     def _update_token(self):
         """Update the KingnetAuth token."""
@@ -181,11 +262,63 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
 
         self._previous_pd_status = curr_status
 
+        # Collection is a best-effort companion request. A failed/malformed
+        # response must neither establish nor change the event baseline.
+        if result.get("collection_fetch_success"):
+            collection_items = result.get("collection_items", [])
+            current_collection_ids = {
+                item.get("collection_id")
+                for item in collection_items
+                if item.get("collection_id")
+            }
+
+            if self._known_collection_ids is None:
+                # First successful poll is baseline-only to avoid replaying the
+                # user's existing uncollected items after HA starts.
+                self._known_collection_ids = set(current_collection_ids)
+            else:
+                new_collection_ids = current_collection_ids - self._known_collection_ids
+                uncollected_count = result.get("collection_uncollected_count", 0)
+
+                for item in collection_items:
+                    collection_id = item.get("collection_id")
+                    if (
+                        collection_id in new_collection_ids
+                        and _is_uncollected(item)
+                    ):
+                        _LOGGER.info("New uncollected item detected: %s", collection_id)
+                        event_data = dict(item)
+                        event_data["uncollected_count"] = uncollected_count
+                        self.hass.bus.async_fire(EVENT_NEW_COLLECTION, event_data)
+
+                # Keep all seen IDs, including claimed items, so later API
+                # changes cannot make an old record look newly delivered.
+                self._known_collection_ids.update(current_collection_ids)
+
         # Best-effort photo archive. Don't block the update on it; if it's slow
         # or fails, the sensor still returns fresh data.
         self.hass.async_create_task(archive_photos(self.hass, all_packages))
 
         return result
+
+    def _fetch_collections(self, headers):
+        """Fetch collection items without allowing this optional API to fail a poll."""
+        try:
+            response = requests.get(COLLECTION_URL, headers=headers, timeout=15)
+            if response.status_code != 200:
+                _LOGGER.warning(
+                    "Collection API request failed, status code: %s",
+                    response.status_code,
+                )
+                return False, []
+
+            valid, items = normalize_collection_response(response.json(), self._com_id)
+            if not valid:
+                _LOGGER.warning("Collection API returned a malformed payload")
+            return valid, items
+        except Exception as err:  # Collection data is deliberately best-effort.
+            _LOGGER.warning("Collection API request failed: %s", err)
+            return False, []
 
     def _fetch_data(self):
         """Fetch data from API (blocking)."""
@@ -203,6 +336,8 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"API request failed: {response.status_code}")
 
         data = response.json()
+
+        collection_fetch_success, collection_items = self._fetch_collections(headers)
 
         # Process packages
         latest_package = None
@@ -244,6 +379,11 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
             "unclaimed_packages": unclaimed_packages,
             "unclaimed_count": len(unclaimed_packages),
             "all_packages": all_packages,
+            "collection_fetch_success": collection_fetch_success,
+            "collection_items": collection_items,
+            "collection_uncollected_count": sum(
+                _is_uncollected(item) for item in collection_items
+            ),
         }
 
 
@@ -256,8 +396,21 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     if DOMAIN not in hass.data:
         hass.data[DOMAIN] = {}
 
+    # getCollectionPayment is scoped by DeviceID rather than com_id. Reuse one
+    # event baseline for every community entry belonging to that DeviceID.
+    collection_states = hass.data[DOMAIN].setdefault("_collection_states", {})
+    collection_state = collection_states.setdefault(
+        _collection_scalar(device_id) or "account",
+        {"known_ids": None},
+    )
+
     # Create coordinator
-    coordinator = SmartdailyDataUpdateCoordinator(hass, device_id, com_id)
+    coordinator = SmartdailyDataUpdateCoordinator(
+        hass,
+        device_id,
+        com_id,
+        collection_state=collection_state,
+    )
 
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()

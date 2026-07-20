@@ -1,9 +1,11 @@
 import asyncio
 import pytest
 from custom_components.smartdaily_postal_ha.sensor import (
+    EVENT_NEW_COLLECTION,
     PackageTrackerSensor,
     PackageSlotSensor,
     SmartdailyDataUpdateCoordinator,
+    normalize_collection_response,
     parse_time,
 )
 
@@ -191,3 +193,284 @@ def test_new_package_event_waits_for_photo_archive(monkeypatch):
     assert order == ["archive", "fire"]
     assert events[0][1]["pd_id"] == new_pid
     assert events[0][1]["photo_local_ready"] is True
+
+
+class RecordingBus:
+    def __init__(self):
+        self.events = []
+
+    def async_fire(self, event_type, event_data):
+        self.events.append((event_type, event_data))
+
+
+class CollectionFakeHass:
+    def __init__(self):
+        self.bus = RecordingBus()
+
+    async def async_add_executor_job(self, func, *args):
+        return func(*args)
+
+    def async_create_task(self, coro):
+        # Photo archiving is unrelated to collection event tests.
+        coro.close()
+
+
+def collection_item(serial_num, is_end="no", **extra):
+    serial_text = str(serial_num)
+    item = {
+        "serial_num": serial_num,
+        "sdate": f"2026/07/{serial_text[-2:]} 10:00",
+        "is_end": is_end,
+        "from_name": "管理室",
+        "note": "原始欄位需保留",
+    }
+    item.update(extra)
+    return item
+
+
+def collection_poll(raw_items=None, success=True):
+    items = []
+    if success:
+        valid, items = normalize_collection_response(
+            {"Data": raw_items or []}, "community"
+        )
+        assert valid is True
+    return {
+        "all_packages": [],
+        "unclaimed_count": 0,
+        "collection_fetch_success": success,
+        "collection_items": items,
+        "collection_uncollected_count": sum(
+            str(item.get("is_end", "")).strip().lower() == "no"
+            for item in items
+        ),
+    }
+
+
+def run_collection_polls(monkeypatch, coordinator, *polls):
+    results = iter(polls)
+    monkeypatch.setattr(coordinator, "_fetch_data", lambda: next(results))
+    for _ in polls:
+        asyncio.run(coordinator._async_update_data())
+
+
+def collection_events(hass):
+    return [
+        data
+        for event_type, data in hass.bus.events
+        if event_type == EVENT_NEW_COLLECTION
+    ]
+
+
+def test_collection_first_successful_poll_only_builds_baseline(monkeypatch):
+    hass = CollectionFakeHass()
+    coordinator = SmartdailyDataUpdateCoordinator(hass, "device", "community")
+
+    run_collection_polls(
+        monkeypatch,
+        coordinator,
+        collection_poll([collection_item("01")]),
+    )
+
+    assert collection_events(hass) == []
+    assert coordinator._known_collection_ids == {
+        "account:01:2026/07/01 10:00"
+    }
+
+
+def test_collection_new_unclaimed_item_fires_once(monkeypatch):
+    hass = CollectionFakeHass()
+    coordinator = SmartdailyDataUpdateCoordinator(hass, "device", "community")
+    old_item = collection_item("01")
+    new_item = collection_item("02", CollectionImage="https://example.com/item.jpg")
+
+    run_collection_polls(
+        monkeypatch,
+        coordinator,
+        collection_poll([old_item]),
+        collection_poll([old_item, new_item]),
+        collection_poll([old_item, new_item]),
+    )
+
+    events = collection_events(hass)
+    assert len(events) == 1
+    assert events[0]["serial_num"] == "02"
+    assert events[0]["collection_id"] == "account:02:2026/07/02 10:00"
+    assert events[0]["uncollected_count"] == 2
+    assert events[0]["note"] == "原始欄位需保留"
+    assert events[0]["CollectionImage"] == "https://example.com/item.jpg"
+
+
+def test_collection_reorder_and_temporary_disappearance_do_not_duplicate(monkeypatch):
+    hass = CollectionFakeHass()
+    coordinator = SmartdailyDataUpdateCoordinator(hass, "device", "community")
+    first = collection_item("01")
+    second = collection_item("02")
+
+    run_collection_polls(
+        monkeypatch,
+        coordinator,
+        collection_poll([first, second]),
+        collection_poll([second, first]),
+        collection_poll([]),
+        collection_poll([first, second]),
+    )
+
+    assert collection_events(hass) == []
+
+
+def test_collection_failed_poll_does_not_establish_or_replace_baseline(monkeypatch):
+    hass = CollectionFakeHass()
+    coordinator = SmartdailyDataUpdateCoordinator(hass, "device", "community")
+    first = collection_item("01")
+    second = collection_item("02")
+
+    run_collection_polls(
+        monkeypatch,
+        coordinator,
+        collection_poll(success=False),
+        collection_poll([first]),
+        collection_poll(success=False),
+        collection_poll([first, second]),
+    )
+
+    events = collection_events(hass)
+    assert [event["serial_num"] for event in events] == ["02"]
+
+
+def test_collection_only_new_unclaimed_items_fire(monkeypatch):
+    hass = CollectionFakeHass()
+    coordinator = SmartdailyDataUpdateCoordinator(hass, "device", "community")
+    existing = collection_item("01")
+    claimed = collection_item("02", is_end="yes")
+    unclaimed = collection_item("03", is_end=" NO ")
+
+    run_collection_polls(
+        monkeypatch,
+        coordinator,
+        collection_poll([existing]),
+        collection_poll([existing, claimed, unclaimed]),
+        collection_poll([existing, dict(claimed, is_end="no"), unclaimed]),
+    )
+
+    events = collection_events(hass)
+    assert [event["serial_num"] for event in events] == ["03"]
+    assert events[0]["is_end"] == " NO "
+
+
+def test_normalize_collection_response_empty_and_malformed():
+    assert normalize_collection_response({"Data": []}, "community") == (True, [])
+
+    malformed_payloads = [None, {}, {"Data": None}, {"Data": "not-a-list"}]
+    for payload in malformed_payloads:
+        assert normalize_collection_response(payload, "community") == (False, [])
+
+    valid, items = normalize_collection_response(
+        {
+            "Data": [
+                None,
+                "not-an-item",
+                {"is_end": "no"},
+                collection_item("04", is_end=" NO "),
+            ]
+        },
+        "community",
+    )
+    assert valid is True
+    assert len(items) == 1
+    assert items[0]["collection_id"] == "account:04:2026/07/04 10:00"
+    assert items[0]["is_end"] == " NO "
+
+
+def test_normalize_collection_id_accepts_numeric_serial_and_empty_sdate():
+    valid, items = normalize_collection_response(
+        {"Data": [{"serial_num": 12345, "sdate": None, "is_end": "no"}]},
+        "community",
+    )
+
+    assert valid is True
+    assert items == [
+        {
+            "serial_num": 12345,
+            "sdate": None,
+            "is_end": "no",
+            "collection_id": "account:12345:",
+        }
+    ]
+
+
+def test_collection_identity_prefers_upstream_community():
+    valid, items = normalize_collection_response(
+        {
+            "Data": [
+                {
+                    "serial_num": "88",
+                    "sdate": "2026/07/20 10:00",
+                    "is_end": "no",
+                    "community": "Shared Community",
+                }
+            ]
+        },
+        "configured-community-id",
+    )
+
+    assert valid is True
+    assert items[0]["collection_id"] == (
+        "Shared Community:88:2026/07/20 10:00"
+    )
+
+
+def test_collection_config_entries_share_one_event_baseline(monkeypatch):
+    hass = CollectionFakeHass()
+    shared_state = {"known_ids": None}
+    first = SmartdailyDataUpdateCoordinator(
+        hass, "same-device", "community-a", collection_state=shared_state
+    )
+    second = SmartdailyDataUpdateCoordinator(
+        hass, "same-device", "community-b", collection_state=shared_state
+    )
+    existing = collection_item("01", community="Shared Community")
+    new_item = collection_item("02", community="Shared Community")
+
+    run_collection_polls(monkeypatch, first, collection_poll([existing]))
+    run_collection_polls(monkeypatch, second, collection_poll([existing]))
+    run_collection_polls(
+        monkeypatch, first, collection_poll([existing, new_item])
+    )
+    run_collection_polls(
+        monkeypatch, second, collection_poll([existing, new_item])
+    )
+
+    events = collection_events(hass)
+    assert [event["serial_num"] for event in events] == ["02"]
+    assert first._known_collection_ids is second._known_collection_ids
+
+
+def test_collection_http_failure_does_not_fail_package_fetch(monkeypatch):
+    class FakeResponse:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    hass = CollectionFakeHass()
+    coordinator = SmartdailyDataUpdateCoordinator(hass, "device", "community")
+    monkeypatch.setattr(coordinator, "_update_token", lambda: None)
+
+    def fake_get(url, headers, timeout=None):
+        if "/Postal/getUserPostalList" in url:
+            return FakeResponse(200, {"Data": []})
+        assert timeout == 15
+        return FakeResponse(503)
+
+    monkeypatch.setattr(
+        "custom_components.smartdaily_postal_ha.sensor.requests.get", fake_get
+    )
+
+    result = coordinator._fetch_data()
+
+    assert result["all_packages"] == []
+    assert result["collection_fetch_success"] is False
+    assert result["collection_items"] == []

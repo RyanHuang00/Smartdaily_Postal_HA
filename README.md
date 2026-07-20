@@ -6,6 +6,8 @@
 > - **照片自動歸檔**：每次 poll 把新 `postal_img` 下載到 `/config/www/packages/<pd_id>.jpg`，永久保存（規避上游 GCS signed URL 15 分鐘過期）。
 > - **新事件 `smartdaily_postal_ha_new_package`**：每當 poll 偵測到新 `pd_id` 即 fire，event payload 為完整 package dict。
 > - **新事件 `smartdaily_postal_ha_package_picked_up`**：每當 `p_status` 從 `1` 轉 `2` 即 fire，event payload 含 `previous_status`、`new_status`。
+> - **新事件 `smartdaily_postal_ha_new_collection`**：同一輪 poll 會以 best-effort 方式查詢寄放物；新增且未領取的項目會 fire，payload 保留 API 欄位並加入 `collection_id`、`uncollected_count`。寄放物 API 失敗不影響包裹感測器更新。
+> - 寄放物端點是帳號範圍；同一 `DeviceID` 的多社區 config entries 共用事件 baseline，避免同一筆寄放物重複通知。
 > - HA 重啟後第一次 poll 不 fire 任何事件，避免歷史包裹被誤判為「新到」。
 >
 > 詳見 commit `feat: history sensor + photo archive + new_package / package_picked_up events`。
