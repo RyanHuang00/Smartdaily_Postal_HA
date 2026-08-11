@@ -140,7 +140,7 @@ def parse_time(time_str):
 class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching Smartdaily data."""
 
-    def __init__(self, hass, device_id, com_id, collection_state=None):
+    def __init__(self, hass, device_id, com_id, collection_state=None, notification_outbox=None):
         """Initialize the coordinator."""
         super().__init__(
             hass,
@@ -150,6 +150,8 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
         )
         self._device_id = device_id
         self._com_id = com_id
+        self._notification_scope = f"{_collection_scalar(device_id)}:{_collection_scalar(com_id)}"
+        self._notification_outbox = notification_outbox
         self._kingnet_auth = ""
         # Maps pd_id -> p_status from the previous poll. None on first run so the
         # integration doesn't spam events for the entire backlog on startup; also
@@ -209,8 +211,14 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
         # Skip event firing on the first run (self._previous_pd_status is None) so
         # the integration doesn't spam the entire backlog on startup. After the
         # first poll we have a baseline and can detect deltas safely.
-        if self._previous_pd_status is not None:
-            prev_ids = set(self._previous_pd_status.keys())
+        previous_status = (
+            self._notification_outbox.previous_status(self._notification_scope)
+            if self._notification_outbox is not None
+            else self._previous_pd_status
+        )
+        new_event_data = {}
+        if previous_status is not None:
+            prev_ids = set(previous_status.keys())
             curr_ids = set(curr_status.keys())
             new_ids = curr_ids - prev_ids
 
@@ -228,22 +236,22 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
                 # the photo proxy does not return a transient 404.
                 archived_new_ids = await archive_photos(self.hass, new_package_entries)
 
-            # New packages: pd_id appears for the first time.
+            # New packages: pd_id appears for the first time. Stage them in the
+            # persistent outbox before firing so HA restarts cannot lose them.
             for pid in new_ids:
                 pkg = next(
                     (p["package"] for p in all_packages if p["package"].get("pd_id") == pid),
                     None,
                 )
                 if pkg:
-                    _LOGGER.info("New package detected: %s", pid)
                     event_data = dict(pkg)
                     event_data["unclaimed_count"] = unclaimed_count
                     event_data["photo_local_ready"] = pid in archived_new_ids
-                    self.hass.bus.async_fire(EVENT_NEW_PACKAGE, event_data)
+                    new_event_data[pid] = event_data
 
             # Pickup transitions: same pd_id, p_status changed to 已取件 (2).
             for pid in curr_ids & prev_ids:
-                old_status = self._previous_pd_status[pid]
+                old_status = previous_status[pid]
                 new_status = curr_status[pid]
                 if old_status != new_status and new_status == STATUS_PICKED_UP:
                     pkg = next(
@@ -260,7 +268,24 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
                         event_data["unclaimed_count"] = unclaimed_count
                         self.hass.bus.async_fire(EVENT_PACKAGE_PICKED_UP, event_data)
 
-        self._previous_pd_status = curr_status
+        if self._notification_outbox is not None:
+            durable_status = dict(previous_status or {})
+            durable_status.update(curr_status)
+            await self._notification_outbox.async_stage(
+                self._notification_scope,
+                durable_status,
+                new_event_data,
+            )
+            for event_data in await self._notification_outbox.async_claim_due(
+                self._notification_scope
+            ):
+                _LOGGER.info("Firing pending package notification: %s", event_data.get("pd_id"))
+                self.hass.bus.async_fire(EVENT_NEW_PACKAGE, event_data)
+        else:
+            for event_data in new_event_data.values():
+                _LOGGER.info("New package detected: %s", event_data.get("pd_id"))
+                self.hass.bus.async_fire(EVENT_NEW_PACKAGE, event_data)
+            self._previous_pd_status = curr_status
 
         # Collection is a best-effort companion request. A failed/malformed
         # response must neither establish nor change the event baseline.
@@ -410,6 +435,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         device_id,
         com_id,
         collection_state=collection_state,
+        notification_outbox=hass.data[DOMAIN].get("package_notification_outbox"),
     )
 
     # Fetch initial data

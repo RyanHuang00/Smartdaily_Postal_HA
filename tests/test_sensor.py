@@ -188,7 +188,7 @@ def test_new_package_event_waits_for_photo_archive(monkeypatch):
         fake_archive_photos,
     )
 
-    asyncio.get_event_loop().run_until_complete(coordinator._async_update_data())
+    asyncio.run(coordinator._async_update_data())
 
     assert order == ["archive", "fire"]
     assert events[0][1]["pd_id"] == new_pid

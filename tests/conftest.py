@@ -26,6 +26,26 @@ helpers = _install_module("homeassistant.helpers")
 event = _install_module("homeassistant.helpers.event")
 event.async_track_time_interval = lambda *args, **kwargs: None
 
+storage = _install_module("homeassistant.helpers.storage")
+
+
+class Store:
+    """In-memory stand-in with persistence across Store instances."""
+
+    data = {}
+
+    def __init__(self, hass, version, key):
+        self.key = key
+
+    async def async_load(self):
+        return self.data.get(self.key)
+
+    async def async_save(self, value):
+        self.data[self.key] = value
+
+
+storage.Store = Store
+
 entity = _install_module("homeassistant.helpers.entity")
 
 
