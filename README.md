@@ -295,6 +295,12 @@
      {{ state_attr('sensor.she_qu_gong_gao', 'content') }}
    ```
 
+## 通知佇列與故障核對
+
+包裹送達、取貨與寄放物事件會先寫入 Home Assistant 的持久佇列，LINE 接受後才分別確認完成。`sensor.bao_guo_li_shi` 的 `notification_outbox` 屬性提供待送件數、最久等待時間、最後成功輪詢時間，以及初次啟動時需要人工核對的件數。請讓 HA 的獨立監看自動化讀取這些欄位並通知手機；單靠整合日誌無法讓外出使用者及時發現故障。
+
+如果儲存的基準遺失，第一次輪詢遇到既有未領包裹或寄放物時，整合會標記為待核對，不會自動重送可能重複的通知。核對後可呼叫 `smartdaily_postal_ha.ack_baseline_reconciliation`，傳入 `kind: package` 或 `collection` 及該筆 `item_id`。不要刪除 `.storage/smartdaily_postal_ha.package_notification_outbox` 來清除告警；那會連待送事件及去重基準一起移除。
+
 ## 🔐 給今網的 APP 改善建議
 
 針對目前條碼作為身分驗證憑證（DeviceSn）設計風險，以下為不需修改後端 API 的 UX 層改善提案：

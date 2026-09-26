@@ -1,8 +1,12 @@
 import asyncio
 import pytest
+from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.helpers.storage import Store
+from custom_components.smartdaily_postal_ha.notification_outbox import PackageNotificationOutbox
 from custom_components.smartdaily_postal_ha.sensor import (
     EVENT_NEW_COLLECTION,
     PackageTrackerSensor,
+    PackageHistorySensor,
     PackageSlotSensor,
     SmartdailyDataUpdateCoordinator,
     normalize_collection_response,
@@ -376,10 +380,8 @@ def test_normalize_collection_response_empty_and_malformed():
         },
         "community",
     )
-    assert valid is True
-    assert len(items) == 1
-    assert items[0]["collection_id"] == "account:04:2026/07/04 10:00"
-    assert items[0]["is_end"] == " NO "
+    assert valid is False
+    assert items == []
 
 
 def test_normalize_collection_id_accepts_numeric_serial_and_empty_sdate():
@@ -474,3 +476,117 @@ def test_collection_http_failure_does_not_fail_package_fetch(monkeypatch):
     assert result["all_packages"] == []
     assert result["collection_fetch_success"] is False
     assert result["collection_items"] == []
+
+
+def test_malformed_postal_payload_fails_poll_instead_of_looking_empty(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"unexpected": []}
+
+    hass = CollectionFakeHass()
+    coordinator = SmartdailyDataUpdateCoordinator(hass, "device", "community")
+    monkeypatch.setattr(coordinator, "_update_token", lambda: None)
+    monkeypatch.setattr(
+        "custom_components.smartdaily_postal_ha.sensor.requests.get",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+
+    with pytest.raises(UpdateFailed, match="malformed"):
+        coordinator._fetch_data()
+
+
+@pytest.mark.parametrize("rows", [
+    [{"pd_id": "pkg", "p_status": "picked-up"}],
+    [{"pd_id": "pkg", "p_status": 1}, {"pd_id": "pkg", "p_status": 2}],
+])
+def test_unknown_status_or_duplicate_package_id_fails_visible_poll(monkeypatch, rows):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"Data": rows}
+
+    coordinator = SmartdailyDataUpdateCoordinator(CollectionFakeHass(), "device", "community")
+    monkeypatch.setattr(coordinator, "_update_token", lambda: None)
+    monkeypatch.setattr(
+        "custom_components.smartdaily_postal_ha.sensor.requests.get",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+    with pytest.raises(UpdateFailed):
+        coordinator._fetch_data()
+
+
+def test_unknown_collection_status_or_colliding_identity_fails_visible_poll():
+    assert normalize_collection_response({"Data": [{"serial_num": "1", "is_end": "maybe"}]}, "community") == (False, [])
+    assert normalize_collection_response({"Data": [
+        {"serial_num": "1", "sdate": "today", "is_end": "no"},
+        {"serial_num": "1", "sdate": "today", "is_end": "yes"},
+    ]}, "community") == (False, [])
+
+
+def test_history_exposes_outbox_health_for_independent_monitor(monkeypatch):
+    class FakeOutbox:
+        def health_snapshot(self):
+            return {
+                "pending_count": 2,
+                "pending_ids": ["26092474112uvpp", "26091978989zvuz"],
+                "oldest_pending_seconds": 1200,
+                "last_successful_poll_at": 1_700_000_000.0,
+            }
+
+    coordinator = SmartdailyDataUpdateCoordinator(
+        CollectionFakeHass(), "device", "community", notification_outbox=FakeOutbox()
+    )
+    coordinator.data = {"all_packages": []}
+    attrs = PackageHistorySensor(coordinator, "device", "community").extra_state_attributes
+    assert attrs["notification_outbox"]["pending_count"] == 2
+    assert attrs["notification_outbox"]["oldest_pending_seconds"] == 1200
+
+
+def test_pickup_and_collection_are_staged_before_events_fire(monkeypatch):
+    Store.data.clear()
+    fired = []
+
+    class FakeBus:
+        def async_fire(self, event_type, event_data):
+            assert outbox.health_snapshot()["pending_count"] >= 1
+            fired.append((event_type, event_data))
+
+    hass = CollectionFakeHass()
+    hass.bus = FakeBus()
+    outbox = PackageNotificationOutbox(hass)
+    coordinator = SmartdailyDataUpdateCoordinator(
+        hass, "device", "community", notification_outbox=outbox
+    )
+    package = {"pd_id": "26092474112uvpp", "p_status": 2}
+    collection = collection_item("42", community="community")
+    collection["collection_id"] = "community:42:2026/07/42 10:00"
+    polls = iter([
+        {
+            "all_packages": [{"package": {**package, "p_status": 1}}],
+            "unclaimed_count": 1,
+            "collection_fetch_success": True,
+            "collection_items": [],
+            "collection_uncollected_count": 0,
+        },
+        {
+            "all_packages": [{"package": package}],
+            "unclaimed_count": 0,
+            "collection_fetch_success": True,
+            "collection_items": [collection],
+            "collection_uncollected_count": 1,
+        },
+    ])
+    monkeypatch.setattr(coordinator, "_fetch_data", lambda: next(polls))
+
+    async def scenario():
+        await outbox.async_load()
+        await coordinator._async_update_data()
+        await coordinator._async_update_data()
+
+    asyncio.run(scenario())
+    assert {event[1]["notification_kind"] for event in fired} == {
+        "package_pickup", "collection",
+    }

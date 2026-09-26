@@ -1,0 +1,44 @@
+ack_package_notification:
+  name: Acknowledge package arrival delivery
+  description: Remove a pending arrival only after LINE accepted its message.
+  fields:
+    pd_id:
+      name: Package ID
+      required: true
+      selector:
+        text:
+ack_pickup_notification:
+  name: Acknowledge package pickup delivery
+  description: Remove a pending pickup only after LINE accepted its message.
+  fields:
+    pd_id:
+      name: Package ID
+      required: true
+      selector:
+        text:
+ack_collection_notification:
+  name: Acknowledge stored-item delivery
+  description: Remove a pending stored-item alert only after LINE accepted its message.
+  fields:
+    collection_id:
+      name: Stored-item ID
+      required: true
+      selector:
+        text:
+ack_baseline_reconciliation:
+  name: Acknowledge baseline reconciliation
+  description: Clear one unverified first-poll item after a human has checked it.
+  fields:
+    kind:
+      name: Item kind
+      required: true
+      selector:
+        select:
+          options:
+            - package
+            - collection
+    item_id:
+      name: Item ID
+      required: true
+      selector:
+        text:
