@@ -21,7 +21,9 @@ _LOGGER = logging.getLogger(__name__)
 
 PHOTO_DIR = "/config/www/packages"
 DOWNLOAD_TIMEOUT = 15  # seconds per photo
-PD_ID_RE = re.compile(r"^[0-9a-f]{15}$")
+# Smartdaily IDs are opaque. Restrict only path-unsafe or implausibly short/long
+# values; the service has already used both hexadecimal and base-36 suffixes.
+PD_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}\Z")
 
 
 async def archive_photos(hass, all_packages: List[dict]) -> Set[str]:

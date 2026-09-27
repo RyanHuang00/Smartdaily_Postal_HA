@@ -75,19 +75,22 @@ def normalize_collection_response(payload, com_id):
     normalized_by_id = {}
     for raw_item in payload["Data"]:
         if not isinstance(raw_item, dict):
-            continue
+            return False, []
 
         collection_id = _collection_id(raw_item, com_id)
         if collection_id is None:
             # Without serial_num there is no safe way to deduplicate events.
-            _LOGGER.warning("Ignoring collection item without serial_num")
-            continue
+            return False, []
+        if _collection_scalar(raw_item.get("is_end")).lower() not in ("yes", "no"):
+            return False, []
 
         # Keep every original API field/value intact in the future event
         # payload; normalization is used only for identity and comparisons.
         item = dict(raw_item)
         item["collection_id"] = collection_id
         # Deduplicate malformed API responses while retaining API order.
+        if collection_id in normalized_by_id and normalized_by_id[collection_id] != item:
+            return False, []
         normalized_by_id[collection_id] = item
 
     return True, list(normalized_by_id.values())
@@ -185,6 +188,7 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
             "https://api.smartdaily.com.tw/api/Valid/getHashCodeV2?code="
             + self._device_id,
             headers=headers_update_token,
+            timeout=15,
         )
         if response.status_code == 200:
             data = response.json()
@@ -217,6 +221,7 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
             else self._previous_pd_status
         )
         new_event_data = {}
+        pickup_event_data = {}
         if previous_status is not None:
             prev_ids = set(previous_status.keys())
             curr_ids = set(curr_status.keys())
@@ -266,7 +271,7 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
                         event_data["previous_status"] = old_status
                         event_data["new_status"] = new_status
                         event_data["unclaimed_count"] = unclaimed_count
-                        self.hass.bus.async_fire(EVENT_PACKAGE_PICKED_UP, event_data)
+                        pickup_event_data[pid] = event_data
 
         if self._notification_outbox is not None:
             durable_status = dict(previous_status or {})
@@ -275,35 +280,52 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
                 self._notification_scope,
                 durable_status,
                 new_event_data,
+                baseline_unverified_ids=(
+                    [pid for pid, status in curr_status.items() if status == 1]
+                    if previous_status is None else None
+                ),
+                pickup_events=pickup_event_data,
             )
             for event_data in await self._notification_outbox.async_claim_due(
                 self._notification_scope
             ):
-                _LOGGER.info("Firing pending package notification: %s", event_data.get("pd_id"))
-                self.hass.bus.async_fire(EVENT_NEW_PACKAGE, event_data)
+                kind = event_data.get("notification_kind", "package_arrival")
+                event_type = EVENT_PACKAGE_PICKED_UP if kind == "package_pickup" else EVENT_NEW_PACKAGE
+                _LOGGER.info("Firing pending %s notification: %s", kind, event_data.get("pd_id"))
+                self.hass.bus.async_fire(event_type, event_data)
         else:
             for event_data in new_event_data.values():
                 _LOGGER.info("New package detected: %s", event_data.get("pd_id"))
                 self.hass.bus.async_fire(EVENT_NEW_PACKAGE, event_data)
+            for event_data in pickup_event_data.values():
+                self.hass.bus.async_fire(EVENT_PACKAGE_PICKED_UP, event_data)
             self._previous_pd_status = curr_status
 
         # Collection is a best-effort companion request. A failed/malformed
         # response must neither establish nor change the event baseline.
         if result.get("collection_fetch_success"):
             collection_items = result.get("collection_items", [])
-            current_collection_ids = {
-                item.get("collection_id")
-                for item in collection_items
-                if item.get("collection_id")
+            current_collection_status = {
+                item["collection_id"]: _is_uncollected(item)
+                for item in collection_items if item.get("collection_id")
             }
+            current_collection_ids = set(current_collection_status)
+            device_scope = _collection_scalar(self._device_id) or "account"
+            previous_collection_ids = (
+                self._notification_outbox.previous_collection_ids(device_scope)
+                if self._notification_outbox is not None
+                else self._known_collection_ids
+            )
 
-            if self._known_collection_ids is None:
+            if previous_collection_ids is None:
                 # First successful poll is baseline-only to avoid replaying the
                 # user's existing uncollected items after HA starts.
-                self._known_collection_ids = set(current_collection_ids)
+                if self._notification_outbox is None:
+                    self._known_collection_ids = set(current_collection_ids)
             else:
-                new_collection_ids = current_collection_ids - self._known_collection_ids
+                new_collection_ids = current_collection_ids - previous_collection_ids
                 uncollected_count = result.get("collection_uncollected_count", 0)
+                collection_events = {}
 
                 for item in collection_items:
                     collection_id = item.get("collection_id")
@@ -314,11 +336,24 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
                         _LOGGER.info("New uncollected item detected: %s", collection_id)
                         event_data = dict(item)
                         event_data["uncollected_count"] = uncollected_count
-                        self.hass.bus.async_fire(EVENT_NEW_COLLECTION, event_data)
+                        collection_events[collection_id] = event_data
 
-                # Keep all seen IDs, including claimed items, so later API
-                # changes cannot make an old record look newly delivered.
-                self._known_collection_ids.update(current_collection_ids)
+                if self._notification_outbox is None:
+                    for event_data in collection_events.values():
+                        self.hass.bus.async_fire(EVENT_NEW_COLLECTION, event_data)
+                    self._known_collection_ids.update(current_collection_ids)
+
+            if self._notification_outbox is not None:
+                await self._notification_outbox.async_stage_collection(
+                    device_scope,
+                    current_collection_status,
+                    collection_events if previous_collection_ids is not None else {},
+                )
+                for event_data in await self._notification_outbox.async_claim_due(
+                    f"collection:{device_scope}"
+                ):
+                    _LOGGER.info("Firing pending collection notification: %s", event_data.get("collection_id"))
+                    self.hass.bus.async_fire(EVENT_NEW_COLLECTION, event_data)
 
         # Best-effort photo archive. Don't block the update on it; if it's slow
         # or fails, the sensor still returns fresh data.
@@ -356,11 +391,23 @@ class SmartdailyDataUpdateCoordinator(DataUpdateCoordinator):
             "Accept": "application/json, text/plain, */*"
         }
 
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=15)
         if response.status_code != 200:
             raise UpdateFailed(f"API request failed: {response.status_code}")
 
         data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get("Data"), list):
+            raise UpdateFailed("Postal API returned a malformed Data list")
+        if any(
+            not isinstance(package, dict) or not package.get("pd_id")
+            for package in data["Data"]
+        ):
+            raise UpdateFailed("Postal API returned a package without pd_id")
+        package_ids = [str(package["pd_id"]) for package in data["Data"]]
+        if len(package_ids) != len(set(package_ids)):
+            raise UpdateFailed("Postal API returned duplicate pd_id values")
+        if any(package.get("p_status") not in (1, STATUS_PICKED_UP) for package in data["Data"]):
+            raise UpdateFailed("Postal API returned an unknown p_status")
 
         collection_fetch_success, collection_items = self._fetch_collections(headers)
 
@@ -703,11 +750,15 @@ class PackageHistorySensor(CoordinatorEntity, Entity):
             reverse=True,
         )
         recent = sorted_packages[:HISTORY_LIMIT]
-        return {
+        attributes = {
             "packages": [self._enrich(entry) for entry in recent],
             "total_count": len(all_packages),
             "limit": HISTORY_LIMIT,
         }
+        outbox = self.coordinator._notification_outbox
+        if outbox is not None:
+            attributes["notification_outbox"] = outbox.health_snapshot()
+        return attributes
 
     @staticmethod
     def _enrich(entry):
